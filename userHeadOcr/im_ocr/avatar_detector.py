@@ -193,7 +193,7 @@ class AvatarDetector:
         # 其他情况直接返回原URL
         return url
     
-    def check_avatar(self, image_input: str) -> Dict[str, Any]:
+    def check_avatar(self, image_input: str, strict_mode: bool = True) -> Dict[str, Any]:
         """
         检测图片中是否存在正确的头像
         支持三种类型的输入：
@@ -203,16 +203,11 @@ class AvatarDetector:
         
         Args:
             image_input: 图片输入（相对路径、URL或百度图片搜索URL）
+            strict_mode: 是否开启严格模式（医生头像场景），默认开启
+                         严格模式要求：单人、无口罩、无帽子、眼睛睁开
         
         Returns:
             dict: 检测结果
-            {
-                "hasValidAvatar": bool,  # 是否有正确的头像
-                "faceCount": int,        # 检测到的人脸数量
-                "message": str,          # 说明信息
-                "details": dict,         # 详细信息（可选）
-                "imageType": str         # 图片类型
-            }
         """
         try:
             # 判断图片类型
@@ -220,10 +215,11 @@ class AvatarDetector:
             
             # 调用 API 检测人脸
             req = models.DetectFaceAttributesRequest()
-            req.MaxFaceNum = 1  # 只检测最大的人脸
+            # 严格模式下检测多张人脸，以便报错
+            req.MaxFaceNum = 5 if strict_mode else 1
             req.FaceModelVersion = "3.0"
-            # 需要返回姿态和口罩信息
-            req.FaceAttributesType = "Headpose,Mask"
+            # 需要返回更多属性：姿态、口罩、帽子、眼睛、眉毛
+            req.FaceAttributesType = "Headpose,Mask,Hat,Eye,Eyebrow"
             
             # 根据图片类型设置不同的参数
             if image_type == 'relative_path':
@@ -268,6 +264,15 @@ class AvatarDetector:
                     "imageType": image_type
                 }
             
+            # 严格模式：检查人脸数量
+            if strict_mode and len(resp.FaceDetailInfos) > 1:
+                return {
+                    "hasValidAvatar": False,
+                    "faceCount": len(resp.FaceDetailInfos),
+                    "message": "检测到多张人脸，请上传单人头像",
+                    "imageType": image_type
+                }
+            
             # 获取第一张人脸（最大的人脸）
             face_info = resp.FaceDetailInfos[0]
             face_rect = face_info.FaceRect
@@ -299,33 +304,50 @@ class AvatarDetector:
                         "hasValidAvatar": False,
                         "faceCount": len(resp.FaceDetailInfos),
                         "message": pose_check["message"],
-                        "details": {
-                            "headPose": {
-                                "pitch": head_pose.Pitch,
-                                "yaw": head_pose.Yaw,
-                                "roll": head_pose.Roll
-                            }
-                        },
+                        "details": {"headPose": self._obj_to_dict(head_pose)},
                         "imageType": image_type
                     }
             
             # 检查口罩遮挡
             mask = attrs.Mask if attrs else None
             if mask:
-                mask_check = self._check_mask(mask)
+                mask_check = self._check_mask(mask, strict_mode)
                 if not mask_check["valid"]:
                     return {
                         "hasValidAvatar": False,
                         "faceCount": len(resp.FaceDetailInfos),
                         "message": mask_check["message"],
-                        "details": {
-                            "mask": {
-                                "type": mask.Type,
-                                "probability": mask.Probability
-                            }
-                        },
+                        "details": {"mask": self._obj_to_dict(mask)},
                         "imageType": image_type
                     }
+            
+            # 严格模式额外检查：帽子、眼睛
+            if strict_mode:
+                # 检查帽子
+                hat = attrs.Hat if attrs else None
+                if hat:
+                    hat_check = self._check_hat(hat)
+                    if not hat_check["valid"]:
+                        return {
+                            "hasValidAvatar": False,
+                            "faceCount": len(resp.FaceDetailInfos),
+                            "message": hat_check["message"],
+                            "details": {"hat": self._obj_to_dict(hat)},
+                            "imageType": image_type
+                        }
+                
+                # 检查眼睛（闭眼/墨镜）
+                eye = attrs.Eye if attrs else None
+                if eye:
+                    eye_check = self._check_eye(eye)
+                    if not eye_check["valid"]:
+                        return {
+                            "hasValidAvatar": False,
+                            "faceCount": len(resp.FaceDetailInfos),
+                            "message": eye_check["message"],
+                            "details": {"eye": self._obj_to_dict(eye)},
+                            "imageType": image_type
+                        }
             
             # 所有检查通过
             return {
@@ -333,21 +355,11 @@ class AvatarDetector:
                 "faceCount": len(resp.FaceDetailInfos),
                 "message": "检测到有效头像",
                 "details": {
-                    "faceRect": {
-                        "x": face_rect.X,
-                        "y": face_rect.Y,
-                        "width": face_rect.Width,
-                        "height": face_rect.Height
-                    },
-                    "headPose": {
-                        "pitch": head_pose.Pitch if head_pose else None,
-                        "yaw": head_pose.Yaw if head_pose else None,
-                        "roll": head_pose.Roll if head_pose else None
-                    } if head_pose else None,
-                    "mask": {
-                        "type": mask.Type if mask else None,
-                        "probability": mask.Probability if mask else None
-                    } if mask else None
+                    "faceRect": self._obj_to_dict(face_rect),
+                    "headPose": self._obj_to_dict(head_pose) if head_pose else None,
+                    "mask": self._obj_to_dict(mask) if mask else None,
+                    "hat": self._obj_to_dict(attrs.Hat) if attrs and attrs.Hat else None,
+                    "eye": self._obj_to_dict(attrs.Eye) if attrs and attrs.Eye else None
                 },
                 "imageType": image_type
             }
@@ -439,12 +451,13 @@ class AvatarDetector:
         
         return {"valid": True, "message": ""}
     
-    def _check_mask(self, mask) -> Dict[str, Any]:
+    def _check_mask(self, mask, strict_mode: bool = False) -> Dict[str, Any]:
         """
         检查口罩遮挡情况
         
         Args:
             mask: 口罩对象
+            strict_mode: 是否严格模式（严格禁止佩戴口罩）
         
         Returns:
             dict: {"valid": bool, "message": str}
@@ -453,7 +466,18 @@ class AvatarDetector:
             return {"valid": True, "message": ""}
         
         # Type: 0-无口罩, 1-有口罩不遮脸, 2-有口罩遮下巴, 3-有口罩遮嘴, 4-正确佩戴口罩
-        # 允许：0（无口罩）和 4（正确佩戴口罩）
+        
+        # 严格模式：只允许 0（无口罩）
+        if strict_mode:
+            if mask.Type == 0:
+                return {"valid": True, "message": ""}
+            else:
+                return {
+                    "valid": False, 
+                    "message": "检测到佩戴口罩（严格模式下禁止佩戴口罩）"
+                }
+        
+        # 普通模式：允许 0（无口罩）和 4（正确佩戴口罩）
         if mask.Type == 0 or mask.Type == 4:
             return {"valid": True, "message": ""}
         
@@ -467,6 +491,109 @@ class AvatarDetector:
             "valid": False,
             "message": f"口罩佩戴不正确: {mask_types.get(mask.Type, '未知')}"
         }
+
+    def _check_hat(self, hat) -> Dict[str, Any]:
+        """
+        检查帽子佩戴情况
+        
+        Args:
+            hat: 帽子对象
+        
+        Returns:
+            dict: {"valid": bool, "message": str}
+        """
+        if not hat:
+            return {"valid": True, "message": ""}
+        
+        # 检查是否佩戴帽子
+        # Hat.Style.Type: 0-不戴帽子，其他值为戴帽子
+        # 注意：需要确保对象属性存在
+        style = getattr(hat, "Style", None)
+        if style:
+            type_val = getattr(style, "Type", 0)
+            if type_val != 0:
+                return {
+                    "valid": False,
+                    "message": "检测到佩戴帽子（请摘除帽子）"
+                }
+        
+        # 也可以检查 Hat.State (如果存在)
+        # 这里主要依赖 Style.Type
+        
+        return {"valid": True, "message": ""}
+
+    def _check_eye(self, eye) -> Dict[str, Any]:
+        """
+        检查眼睛状态（闭眼、墨镜）
+        
+        Args:
+            eye: 眼睛对象
+        
+        Returns:
+            dict: {"valid": bool, "message": str}
+        """
+        if not eye:
+            return {"valid": True, "message": ""}
+        
+        # 1. 检查是否闭眼
+        # EyeOpen.Type: 0-闭眼, 1-睁眼 (假设 SDK 定义)
+        # 或者 Probability > 阈值
+        eye_open = getattr(eye, "EyeOpen", None)
+        if eye_open:
+            # 如果 Probability 存在且较高，且 Type 指示闭眼
+            prob = getattr(eye_open, "Probability", 0)
+            type_val = getattr(eye_open, "Type", 1) # 默认睁眼
+            
+            # 如果明确识别为闭眼 (Type=0) 且置信度 > 70%
+            if type_val == 0 and prob > 70:
+                return {
+                    "valid": False,
+                    "message": "检测到闭眼（请保持眼睛睁开）"
+                }
+        
+        # 2. 检查是否戴墨镜
+        # Glass.Type: 0-不戴, 1-普通眼镜, 2-墨镜
+        glass = getattr(eye, "Glass", None)
+        if glass:
+            type_val = getattr(glass, "Type", 0)
+            if type_val == 2:
+                return {
+                    "valid": False,
+                    "message": "检测到佩戴墨镜（请摘除墨镜）"
+                }
+        
+        return {"valid": True, "message": ""}
+
+    def _obj_to_dict(self, obj) -> Dict[str, Any]:
+        """
+        将 SDK 对象转换为字典
+        """
+        if not obj:
+            return None
+        
+        result = {}
+        # 遍历属性
+        for key in dir(obj):
+            if key.startswith('_'):
+                continue
+            
+            val = getattr(obj, key)
+            if callable(val):
+                continue
+                
+            # 递归处理子对象 (假设子对象也是 SDK Model)
+            if hasattr(val, "_serialize"): # SDK Model 通常有这个
+                result[key] = self._obj_to_dict(val)
+            elif isinstance(val, (str, int, float, bool, list, dict, type(None))):
+                result[key] = val
+            else:
+                # 尝试简单转换
+                try:
+                    result[key] = self._obj_to_dict(val)
+                except:
+                    result[key] = str(val)
+                    
+        return result
 
 
 def main():
@@ -496,21 +623,23 @@ def main():
     # 示例2：类型2 - 直接图片URL
     image_input = "https://randomuser.me/api/portraits/men/1.jpg"
     
-    # 示例3：类型3 - 百度图片搜索URL（会自动提取实际图片URL）
-    # image_input = "https://image.baidu.com/search/detail?adpicid=0&b_applid=9789573169742938504&bdtype=0&commodity=&copyright=&cs=1850186389%2C55921271&di=7565560840087142401&fr=click-pic&fromurl=http%253A%252F%252Fwww.duitang.com%252Fblog%252F%253Fid%253D1512294406&gsm=78&hd=&height=0&hot=&ic=&ie=utf-8&imgformat=&imgratio=&imgspn=0&is=0%2C0&isImgSet=&latest=&lid=&lm=&objurl=https%253A%252F%252Fc-ssl.dtstatic.com%252Fuploads%252Fblog%252F202402%252F07%252FV2SOZWG9Cmg0Vq2.thumb.1000_0.png&os=1037517498%2C2535813189&pd=image_content&pi=0&pn=91&rn=1&simid=1850186389%2C55921271&tn=baiduimagedetail&width=0&word=%E7%9C%9F%E4%BA%BA%E5%A4%B4%E5%83%8F&z="
-    
-    result = detector.check_avatar(image_input)
-    
-    # 输出结果
+    print("-" * 50)
+    print("测试 1: 严格模式（默认）- 适用于医生头像")
+    result = detector.check_avatar(image_input, strict_mode=True)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     
-    # 判断结果
     if result["hasValidAvatar"]:
-        print(f"\n✓ 检测到有效头像，共 {result['faceCount']} 张人脸")
-        print(f"  图片类型: {result.get('imageType', 'unknown')}")
+        print(f"✓ 检测到有效头像")
     else:
-        print(f"\n✗ 未检测到有效头像: {result['message']}")
-        print(f"  图片类型: {result.get('imageType', 'unknown')}")
+        print(f"✗ 未检测到有效头像: {result['message']}")
+
+    print("\n" + "-" * 50)
+    print("测试 2: 普通模式 - 适用于一般用户头像")
+    # 普通模式允许戴口罩（正确佩戴）
+    result_loose = detector.check_avatar(image_input, strict_mode=False)
+    # 简略输出
+    print(f"检测结果: {'通过' if result_loose['hasValidAvatar'] else '失败'}")
+    print(f"消息: {result_loose['message']}")
 
 
 if __name__ == "__main__":

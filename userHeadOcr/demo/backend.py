@@ -12,6 +12,7 @@ import base64
 import json
 import shutil
 import urllib.parse
+import io
 from enum import Enum
 from tencentcloud.common import credential
 from tencentcloud.common.profile.client_profile import ClientProfile
@@ -50,6 +51,10 @@ class HeadOCR:
     YAW_MAX = 10     # 左右偏移最大值
     ROLL_MIN = -20   # 平面旋转最小值
     ROLL_MAX = 20    # 平面旋转最大值
+
+    # 遮挡检查阈值 (0-100，数值越小表示遮挡越严重，数值越大表示越完整)
+    # 建议阈值：50-60。调整为60以更严格地检测遮挡（如嘴部遮挡）
+    COMPLETENESS_THRESHOLD = 60
     
     def __init__(self, secret_id: str, secret_key: str, region: str = 'ap-shanghai'):
         """
@@ -166,6 +171,7 @@ class HeadOCR:
     def _read_local_image_as_base64(self, file_path: str) -> str:
         """
         读取本地图片文件并转换为base64编码
+        如果图片过大，会自动压缩
         
         Args:
             file_path: 本地文件路径（相对路径或绝对路径）
@@ -191,9 +197,11 @@ class HeadOCR:
             raise FileNotFoundError(f"图片文件不存在: {file_path}")
         
         # 检查文件大小（base64编码后不能超过5M）
+        # Base64编码后大小约为原始大小的4/3，所以原始大小超过3.75MB就有可能超标
+        # 这里为了保险起见，设定阈值为3.5MB
         file_size = os.path.getsize(file_path)
-        if file_size > 5 * 1024 * 1024:  # 5MB
-            raise IOError(f"图片文件过大: {file_size} 字节，base64编码后可能超过5M限制")
+        if file_size > 3.5 * 1024 * 1024:  # 3.5MB
+            return self._compress_image(file_path)
         
         # 读取文件并转换为base64
         try:
@@ -201,14 +209,64 @@ class HeadOCR:
                 image_data = f.read()
                 base64_data = base64.b64encode(image_data).decode('utf-8')
                 
-                # 检查base64编码后的大小
+                # 再次检查base64编码后的大小
                 base64_size = len(base64_data)
                 if base64_size > 5 * 1024 * 1024:  # 5MB
-                    raise IOError(f"图片base64编码后大小超过5M限制: {base64_size} 字节")
+                    # 如果还是太大，尝试压缩
+                    return self._compress_image(file_path)
                 
                 return base64_data
         except Exception as e:
             raise IOError(f"读取图片文件失败: {str(e)}")
+
+    def _compress_image(self, file_path: str) -> str:
+        """
+        压缩图片到指定大小以下并转换为base64
+        目标是base64编码后小于5MB (即二进制小于3.75MB)
+        """
+        try:
+            from PIL import Image as PILImage
+        except ImportError:
+            raise IOError("图片过大且未安装Pillow库，无法进行压缩处理")
+
+        # 目标大小：3.5MB (留有余量)
+        target_size = 3.5 * 1024 * 1024
+        
+        try:
+            with PILImage.open(file_path) as img:
+                # 转换为RGB (去除Alpha通道，因为JPEG不支持)
+                if img.mode in ('RGBA', 'P'):
+                    img = img.convert('RGB')
+                
+                # 初始参数
+                quality = 85
+                resize_ratio = 0.8
+                width, height = img.size
+                
+                output_buffer = io.BytesIO()
+                # 尝试保存
+                img.save(output_buffer, format='JPEG', quality=quality)
+                
+                # 循环压缩直到满足大小要求
+                while output_buffer.tell() > target_size and (quality > 10 or width > 200):
+                    output_buffer = io.BytesIO()
+                    
+                    if quality > 30:
+                        # 优先降低质量
+                        quality -= 10
+                    else:
+                        # 质量已经很低了，开始缩小尺寸
+                        width = int(width * resize_ratio)
+                        height = int(height * resize_ratio)
+                        if width < 100 or height < 100:
+                            break
+                        img = img.resize((width, height))
+                    
+                    img.save(output_buffer, format='JPEG', quality=quality)
+                
+                return base64.b64encode(output_buffer.getvalue()).decode('utf-8')
+        except Exception as e:
+            raise IOError(f"图片压缩失败: {str(e)}")
     
     def check_avatar(self, image_input: str, image_source: ImageSource = None, 
                      pitch_min: float = None, pitch_max: float = None,
@@ -249,10 +307,14 @@ class HeadOCR:
             
             # 调用 API 检测人脸
             req = models.DetectFaceAttributesRequest()
-            req.MaxFaceNum = 1  # 只检测最大的人脸
+            req.MaxFaceNum = 5  # 检测多张人脸以进行数量校验
             req.FaceModelVersion = "3.0"
-            # 需要返回姿态和口罩信息
-            req.FaceAttributesType = "Headpose,Mask"
+            # 只保留头像校验相关的属性
+            # 增加 Mouth, Nose 以便潜在的属性检查，虽然遮挡主要靠 FaceQualityInfo
+            req.FaceAttributesType = "Headpose,Mask,Glass,Eye,Mouth,Nose"
+            # 开启质量检测以获取 Completeness (遮挡信息)
+            # DetectFaceAttributes 接口默认包含质量信息，不需要 NeedQualityDetection 参数
+            # req.NeedQualityDetection = 1
             
             # 根据图片类型设置不同的参数
             if image_source == ImageSource.LOCAL_FILE:
@@ -270,7 +332,8 @@ class HeadOCR:
                         "faceCount": 0,
                         "message": f"图片文件不存在: {str(e)}",
                         "imagePath": image_input,
-                        "imageSource": image_source.value
+                        "imageSource": image_source.value,
+                        "config": {}
                     }
                 except IOError as e:
                     return {
@@ -278,7 +341,8 @@ class HeadOCR:
                         "faceCount": 0,
                         "message": f"读取图片文件失败: {str(e)}",
                         "imagePath": image_input,
-                        "imageSource": image_source.value
+                        "imageSource": image_source.value,
+                        "config": {}
                     }
             else:
                 # 类型2或类型3：URL类型
@@ -302,13 +366,34 @@ class HeadOCR:
                     "faceCount": 0,
                     "message": "图片中未检测到人脸",
                     "imagePath": actual_image_path,
-                    "imageSource": image_source.value
+                    "imageSource": image_source.value,
+                    "config": {
+                        "pitch_min": current_pitch_min, "pitch_max": current_pitch_max,
+                        "yaw_min": current_yaw_min, "yaw_max": current_yaw_max,
+                        "roll_min": current_roll_min, "roll_max": current_roll_max
+                    }
+                }
+            
+            # 检查人脸数量（必须严格为1）
+            if len(resp.FaceDetailInfos) > 1:
+                return {
+                    "hasValidAvatar": False,
+                    "faceCount": len(resp.FaceDetailInfos),
+                    "message": f"图片中检测到 {len(resp.FaceDetailInfos)} 张人脸，只允许包含一张人脸",
+                    "imagePath": actual_image_path,
+                    "imageSource": image_source.value,
+                    "config": {
+                        "pitch_min": current_pitch_min, "pitch_max": current_pitch_max,
+                        "yaw_min": current_yaw_min, "yaw_max": current_yaw_max,
+                        "roll_min": current_roll_min, "roll_max": current_roll_max
+                    }
                 }
             
             # 获取第一张人脸（最大的人脸）
             face_info = resp.FaceDetailInfos[0]
             face_rect = face_info.FaceRect
             attrs = face_info.FaceDetailAttributesInfo
+            quality = getattr(face_info, "FaceQualityInfo", None)
             
             # 检查人脸框
             if not self._check_face_rect(face_rect):
@@ -325,13 +410,20 @@ class HeadOCR:
                         }
                     },
                     "imagePath": actual_image_path,
-                    "imageSource": image_source.value
+                    "imageSource": image_source.value,
+                    "config": {
+                        "pitch_min": current_pitch_min, "pitch_max": current_pitch_max,
+                        "yaw_min": current_yaw_min, "yaw_max": current_yaw_max,
+                        "roll_min": current_roll_min, "roll_max": current_roll_max
+                    }
                 }
             
-            # 检查姿态
+            # 收集所有校验错误
+            validation_errors = []
+            
+            # 1. 检查姿态
             head_pose = attrs.HeadPose if attrs else None
             if head_pose:
-                # 使用当前配置的阈值进行检查
                 pose_check = self._check_head_pose_with_limits(
                     head_pose, 
                     current_pitch_min, current_pitch_max,
@@ -339,71 +431,86 @@ class HeadOCR:
                     current_roll_min, current_roll_max
                 )
                 if not pose_check["valid"]:
-                    return {
-                        "hasValidAvatar": False,
-                        "faceCount": len(resp.FaceDetailInfos),
-                        "message": pose_check["message"],
-                        "details": {
-                            "headPose": {
-                                "pitch": head_pose.Pitch,
-                                "yaw": head_pose.Yaw,
-                                "roll": head_pose.Roll
-                            }
-                        },
-                        "imagePath": actual_image_path,
-                        "imageSource": image_source.value,
-                        "config": {
-                            "pitch_min": current_pitch_min, "pitch_max": current_pitch_max,
-                            "yaw_min": current_yaw_min, "yaw_max": current_yaw_max,
-                            "roll_min": current_roll_min, "roll_max": current_roll_max
-                        }
-                    }
+                    validation_errors.append(pose_check["message"])
             
-            # 检查口罩遮挡
+            # 2. 检查口罩
             mask = attrs.Mask if attrs else None
             if mask:
                 mask_check = self._check_mask(mask)
                 if not mask_check["valid"]:
-                    return {
-                        "hasValidAvatar": False,
-                        "faceCount": len(resp.FaceDetailInfos),
-                        "message": mask_check["message"],
-                        "details": {
-                            "mask": {
-                                "type": mask.Type,
-                                "probability": mask.Probability
-                            }
-                        },
-                        "imagePath": actual_image_path,
-                        "imageSource": image_source.value,
-                        "config": {
-                            "pitch_min": current_pitch_min, "pitch_max": current_pitch_max,
-                            "yaw_min": current_yaw_min, "yaw_max": current_yaw_max,
-                            "roll_min": current_roll_min, "roll_max": current_roll_max
+                    validation_errors.append(mask_check["message"])
+            
+            # 3. 检查眼镜
+            glass = attrs.Eye.Glass if attrs and attrs.Eye else None
+            if glass:
+                glass_check = self._check_glass(glass)
+                if not glass_check["valid"]:
+                    validation_errors.append(glass_check["message"])
+            
+            # 4. 检查眼睛
+            eye = attrs.Eye if attrs else None
+            if eye:
+                eye_check = self._check_eye(eye)
+                if not eye_check["valid"]:
+                    validation_errors.append(eye_check["message"])
+            
+            # 5. 检查遮挡 (FaceQualityInfo.Completeness)
+            if quality:
+                occlusion_check = self._check_occlusion(quality)
+                if not occlusion_check["valid"]:
+                    validation_errors.append(occlusion_check["message"])
+
+            # 提取校验相关的属性供返回
+            attributes = {
+                "glass": attrs.Eye.Glass.Type if attrs and attrs.Eye and attrs.Eye.Glass else None,
+                "mask": attrs.Mask.Type if attrs and attrs.Mask else None,
+                "eye_open": attrs.Eye.EyeOpen.Type if attrs and attrs.Eye and attrs.Eye.EyeOpen else None,
+                "headpose": {
+                    "pitch": head_pose.Pitch if head_pose else None,
+                    "yaw": head_pose.Yaw if head_pose else None,
+                    "roll": head_pose.Roll if head_pose else None
+                } if head_pose else None,
+                "completeness": {
+                    "eye": quality.Completeness.Eye if quality and quality.Completeness else None,
+                    "mouth": quality.Completeness.Mouth if quality and quality.Completeness else None,
+                    "nose": quality.Completeness.Nose if quality and quality.Completeness else None
+                } if quality else None
+            }
+            
+            # 如果有校验错误
+            if validation_errors:
+                return {
+                    "hasValidAvatar": False,
+                    "faceCount": len(resp.FaceDetailInfos),
+                    "message": " | ".join(validation_errors),
+                    "attributes": attributes,
+                    "details": {
+                        "faceRect": {
+                            "x": face_rect.X, "y": face_rect.Y, "width": face_rect.Width, "height": face_rect.Height
                         }
+                    },
+                    "imagePath": actual_image_path,
+                    "imageSource": image_source.value,
+                    "config": {
+                        "pitch_min": current_pitch_min, "pitch_max": current_pitch_max,
+                        "yaw_min": current_yaw_min, "yaw_max": current_yaw_max,
+                        "roll_min": current_roll_min, "roll_max": current_roll_max
                     }
+                }
             
             # 所有检查通过
             return {
                 "hasValidAvatar": True,
                 "faceCount": len(resp.FaceDetailInfos),
                 "message": "检测到有效头像",
+                "attributes": attributes,
                 "details": {
                     "faceRect": {
                         "x": face_rect.X,
                         "y": face_rect.Y,
                         "width": face_rect.Width,
                         "height": face_rect.Height
-                    },
-                    "headPose": {
-                        "pitch": head_pose.Pitch if head_pose else None,
-                        "yaw": head_pose.Yaw if head_pose else None,
-                        "roll": head_pose.Roll if head_pose else None
-                    } if head_pose else None,
-                    "mask": {
-                        "type": mask.Type if mask else None,
-                        "probability": mask.Probability if mask else None
-                    } if mask else None
+                    }
                 },
                 "imagePath": actual_image_path,
                 "imageSource": image_source.value,
@@ -511,6 +618,42 @@ class HeadOCR:
             self.ROLL_MIN, self.ROLL_MAX
         )
     
+    def _check_occlusion(self, quality) -> Dict[str, Any]:
+        """
+        检查五官遮挡情况 (基于 FaceQualityInfo.Completeness)
+        
+        Args:
+            quality: 质量信息对象
+            
+        Returns:
+            dict: {"valid": bool, "message": str}
+        """
+        if not quality or not quality.Completeness:
+            # 如果没有质量信息，暂时认为通过（或者是API未返回）
+            return {"valid": True, "message": ""}
+            
+        completeness = quality.Completeness
+        threshold = self.COMPLETENESS_THRESHOLD
+        
+        errors = []
+        
+        # 检查眼睛完整度
+        if completeness.Eye < threshold:
+            errors.append(f"眼睛被遮挡(完整度{completeness.Eye}<{threshold})")
+            
+        # 检查嘴巴完整度
+        if completeness.Mouth < threshold:
+            errors.append(f"嘴巴被遮挡(完整度{completeness.Mouth}<{threshold})")
+            
+        # 检查鼻子完整度
+        if completeness.Nose < threshold:
+            errors.append(f"鼻子被遮挡(完整度{completeness.Nose}<{threshold})")
+            
+        if errors:
+            return {"valid": False, "message": " | ".join(errors)}
+            
+        return {"valid": True, "message": ""}
+
     def _check_mask(self, mask) -> Dict[str, Any]:
         """
         检查口罩遮挡情况
@@ -524,21 +667,61 @@ class HeadOCR:
         if not mask:
             return {"valid": True, "message": ""}
         
-        # Type: 0-无口罩, 1-有口罩不遮脸, 2-有口罩遮下巴, 3-有口罩遮嘴, 4-正确佩戴口罩
-        # 允许：0（无口罩）和 4（正确佩戴口罩）
-        if mask.Type == 0 or mask.Type == 4:
+        # 允许：0（无口罩）
+        # 禁止：其他任何类型（包括正确佩戴口罩）
+        if mask.Type == 0:
             return {"valid": True, "message": ""}
         
         mask_types = {
             1: "有口罩但不遮脸",
             2: "有口罩遮下巴",
-            3: "有口罩遮嘴"
+            3: "有口罩遮嘴",
+            4: "正确佩戴口罩"
         }
         
         return {
             "valid": False,
-            "message": f"口罩佩戴不正确: {mask_types.get(mask.Type, '未知')}"
+            "message": f"检测到佩戴口罩: {mask_types.get(mask.Type, '未知')}"
         }
+
+    def _check_glass(self, glass) -> Dict[str, Any]:
+        """
+        检查眼镜佩戴情况
+        
+        Args:
+            glass: 眼镜对象
+            
+        Returns:
+            dict: {"valid": bool, "message": str}
+        """
+        if not glass:
+            return {"valid": True, "message": ""}
+            
+        # Type: 0-无眼镜, 1-普通眼镜, 2-墨镜
+        if glass.Type == 2:
+            return {"valid": False, "message": "检测到佩戴墨镜"}
+            
+        return {"valid": True, "message": ""}
+
+    def _check_eye(self, eye) -> Dict[str, Any]:
+        """
+        检查眼睛状态
+        
+        Args:
+            eye: 眼睛对象
+            
+        Returns:
+            dict: {"valid": bool, "message": str}
+        """
+        if not eye or not eye.EyeOpen:
+            return {"valid": True, "message": ""}
+            
+        # EyeOpen.Type: 0-睁开, 1-闭眼
+        if eye.EyeOpen.Type == 1:
+             # 只要检测为闭眼，即认为不合格
+             return {"valid": False, "message": "检测到闭眼"}
+                 
+        return {"valid": True, "message": ""}
 
 
 app = FastAPI()

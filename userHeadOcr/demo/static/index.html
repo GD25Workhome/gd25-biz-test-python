@@ -188,13 +188,52 @@
 
                 <el-table-column label="操作" width="220" fixed="right">
                     <template #default="scope">
-                        <el-button size="small" type="success" @click="handleOCR(scope.row)" :loading="scope.row.ocrLoading">OCR识别</el-button>
-                        <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
-                        <el-button size="small" type="danger" @click="handleDelete(scope.row)">删除</el-button>
+                        <div style="display: flex; flex-direction: column; gap: 5px;">
+                            <div style="display: flex; gap: 5px;">
+                                <el-button size="small" @click="handleEdit(scope.row)" style="flex: 1;">编辑</el-button>
+                                <el-button size="small" type="danger" @click="handleDelete(scope.row)" style="flex: 1;">删除</el-button>
+                            </div>
+                            <el-button size="small" type="success" @click="handleOCR(scope.row)" :loading="scope.row.ocrLoading" style="width: 100%; margin-left: 0;">OCR识别</el-button>
+                            <el-button size="small" type="info" @click="handlePreview(scope.row)" style="width: 100%; margin-left: 0;">详细数据预览</el-button>
+                        </div>
                     </template>
                 </el-table-column>
             </el-table>
         </div>
+
+        <!-- 详细数据预览对话框 -->
+        <el-dialog
+            v-model="previewDialogVisible"
+            title="详细数据预览"
+            width="600px">
+            <el-descriptions :column="1" border>
+                <el-descriptions-item label="ID">{{ previewData.id }}</el-descriptions-item>
+                <el-descriptions-item label="URL">
+                    <a :href="previewData.URL" target="_blank" style="word-break: break-all;">{{ previewData.URL }}</a>
+                </el-descriptions-item>
+                <el-descriptions-item label="本地文件名">{{ previewData.本地文件名 }}</el-descriptions-item>
+                <el-descriptions-item label="下载时间">{{ previewData.下载时间 }}</el-descriptions-item>
+                <el-descriptions-item label="是否应该通过">
+                    <el-tag v-if="previewData.should_pass === true" type="success">是</el-tag>
+                    <el-tag v-else-if="previewData.should_pass === false" type="danger">否</el-tag>
+                    <span v-else>-</span>
+                </el-descriptions-item>
+                <el-descriptions-item label="OCR是否通过">
+                    <el-tag v-if="previewData.ocr_passed === true" type="success">是</el-tag>
+                    <el-tag v-else-if="previewData.ocr_passed === false" type="danger">否</el-tag>
+                    <span v-else>-</span>
+                </el-descriptions-item>
+                <el-descriptions-item label="OCR 原始结果">
+                    <div class="ocr-result">{{ previewData.ocr_result }}</div>
+                </el-descriptions-item>
+                <el-descriptions-item label="OCR 解析摘要">
+                    <div class="ocr-summary">{{ getOcrSummary(previewData.ocr_result) }}</div>
+                </el-descriptions-item>
+                <el-descriptions-item label="OCR 参数配置">
+                    <div class="ocr-result">{{ getOcrConfig(previewData.ocr_result) }}</div>
+                </el-descriptions-item>
+            </el-descriptions>
+        </el-dialog>
 
         <!-- 编辑/新增对话框 -->
         <el-dialog
@@ -265,6 +304,8 @@
                 const loading = ref(false);
                 const dialogVisible = ref(false);
                 const isEdit = ref(false);
+                const previewDialogVisible = ref(false);
+                const previewData = ref({});
                 const uploadMode = ref('file'); // Default to 'file'
                 const fileList = ref([]);
                 const form = reactive({
@@ -496,6 +537,12 @@
                 // 单个 OCR 识别
                 const handleOCR = (row) => performOCR(row, true);
 
+                // 预览详细数据
+                const handlePreview = (row) => {
+                    previewData.value = row;
+                    previewDialogVisible.value = true;
+                };
+
                 // 批量选择变化
                 const handleSelectionChange = (val) => {
                     selectedItems.value = val;
@@ -529,7 +576,36 @@
                         if (result.message) {
                              // Add icon/color based on hasValidAvatar
                             const icon = result.hasValidAvatar ? '✅ ' : '❌ ';
-                            return icon + result.message;
+                            let summary = icon + result.message;
+                            
+                            // Add detailed attributes if available
+                            if (result.attributes) {
+                                const attrs = result.attributes;
+                                const details = [];
+                                
+                                // Glass
+                                if (attrs.glass !== null && attrs.glass !== undefined) {
+                                    const glassMap = { 0: '无眼镜', 1: '普通眼镜', 2: '墨镜' };
+                                    details.push(`眼镜: ${glassMap[attrs.glass] || attrs.glass}`);
+                                }
+                                
+                                // Mask
+                                if (attrs.mask !== null && attrs.mask !== undefined) {
+                                    details.push(`口罩: ${attrs.mask === 0 ? '无' : '有'}`);
+                                }
+                                
+                                // Eye
+                                if (attrs.eye_open !== null && attrs.eye_open !== undefined) {
+                                    const eyeMap = { 0: '睁开', 1: '闭眼' };
+                                    details.push(`眼睛: ${eyeMap[attrs.eye_open] || attrs.eye_open}`);
+                                }
+                                
+                                if (details.length > 0) {
+                                    summary += '\nDetails: ' + details.join(', ');
+                                }
+                            }
+                            
+                            return summary;
                         }
                         // Fallback for old data or errors
                         if (result.Error) return '❌ 错误: ' + result.Error;
@@ -625,7 +701,10 @@
                     getOcrSummary,
                     getOcrConfig,
                     ocrConfig,
-                    downloadOcrResults
+                    downloadOcrResults,
+                    previewDialogVisible,
+                    previewData,
+                    handlePreview
                 };
             }
         });

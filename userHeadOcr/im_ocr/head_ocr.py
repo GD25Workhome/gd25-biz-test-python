@@ -212,6 +212,12 @@ class HeadOCR:
     def check_avatar(self, image_input: str, image_source: ImageSource = None) -> Dict[str, Any]:
         """
         检测图片中是否存在正确的头像
+        
+        功能特点：
+        - 限制头像中只能有一张人脸，检测到多张人脸会返回错误
+        - 只识别头像相关的属性：姿态（Headpose）、口罩（Mask）、眼睛（Eye）、帽子（Hat）
+        - 返回结果只包含头像相关的属性信息
+        
         支持三种类型的输入：
         1. 本地图片文件（相对路径或绝对路径）- 转为base64后使用Image参数
         2. 直接图片URL - 使用Url参数
@@ -225,9 +231,9 @@ class HeadOCR:
             dict: 检测结果
             {
                 "hasValidAvatar": bool,  # 是否有正确的头像
-                "faceCount": int,        # 检测到的人脸数量
+                "faceCount": int,        # 检测到的人脸数量（成功时为1，失败时可能为0或多张）
                 "message": str,          # 说明信息
-                "details": dict,         # 详细信息（可选）
+                "details": dict,         # 详细信息（只包含头像相关属性：faceRect、headPose、mask、eye、hat）
                 "imagePath": str,        # 实际使用的图片路径或URL
                 "imageSource": str       # 图片来源类型
             }
@@ -239,10 +245,10 @@ class HeadOCR:
             
             # 调用 API 检测人脸
             req = models.DetectFaceAttributesRequest()
-            req.MaxFaceNum = 1  # 只检测最大的人脸
+            req.MaxFaceNum = 5  # 检测最多5张人脸，用于验证是否只有一张
             req.FaceModelVersion = "3.0"
-            # 需要返回姿态和口罩信息
-            req.FaceAttributesType = "Headpose,Mask"
+            # 只请求头像相关的属性：姿态、口罩、眼睛、帽子
+            req.FaceAttributesType = "Headpose,Mask,Eye,Hat"
             
             # 根据图片类型设置不同的参数
             if image_source == ImageSource.LOCAL_FILE:
@@ -295,7 +301,17 @@ class HeadOCR:
                     "imageSource": image_source.value
                 }
             
-            # 获取第一张人脸（最大的人脸）
+            # 验证是否只有一张人脸（头像要求）
+            if len(resp.FaceDetailInfos) > 1:
+                return {
+                    "hasValidAvatar": False,
+                    "faceCount": len(resp.FaceDetailInfos),
+                    "message": "检测到多张人脸，请上传单人头像",
+                    "imagePath": actual_image_path,
+                    "imageSource": image_source.value
+                }
+            
+            # 获取第一张人脸（也是唯一一张）
             face_info = resp.FaceDetailInfos[0]
             face_rect = face_info.FaceRect
             attrs = face_info.FaceDetailAttributesInfo
@@ -358,27 +374,14 @@ class HeadOCR:
                     }
             
             # 所有检查通过
+            # 提取头像相关的属性信息
+            avatar_attributes = self._extract_avatar_attributes(face_info)
+            
             return {
                 "hasValidAvatar": True,
-                "faceCount": len(resp.FaceDetailInfos),
+                "faceCount": 1,  # 已验证只有一张人脸
                 "message": "检测到有效头像",
-                "details": {
-                    "faceRect": {
-                        "x": face_rect.X,
-                        "y": face_rect.Y,
-                        "width": face_rect.Width,
-                        "height": face_rect.Height
-                    },
-                    "headPose": {
-                        "pitch": head_pose.Pitch if head_pose else None,
-                        "yaw": head_pose.Yaw if head_pose else None,
-                        "roll": head_pose.Roll if head_pose else None
-                    } if head_pose else None,
-                    "mask": {
-                        "type": mask.Type if mask else None,
-                        "probability": mask.Probability if mask else None
-                    } if mask else None
-                },
+                "details": avatar_attributes,
                 "imagePath": actual_image_path,
                 "imageSource": image_source.value
             }
@@ -500,6 +503,93 @@ class HeadOCR:
             "valid": False,
             "message": f"口罩佩戴不正确: {mask_types.get(mask.Type, '未知')}"
         }
+    
+    def _extract_avatar_attributes(self, face_info) -> Dict[str, Any]:
+        """
+        从 FaceDetailInfo 中提取头像相关的属性
+        
+        Args:
+            face_info: FaceDetailInfo 对象
+        
+        Returns:
+            dict: 包含头像相关属性的字典
+        """
+        attrs = face_info.FaceDetailAttributesInfo if face_info else None
+        face_rect = face_info.FaceRect if face_info else None
+        
+        result = {}
+        
+        # 人脸框位置（必需）
+        if face_rect:
+            result["faceRect"] = {
+                "x": face_rect.X,
+                "y": face_rect.Y,
+                "width": face_rect.Width,
+                "height": face_rect.Height
+            }
+        
+        # 姿态信息（如果存在）
+        if attrs and hasattr(attrs, 'HeadPose') and attrs.HeadPose:
+            head_pose = attrs.HeadPose
+            result["headPose"] = {
+                "pitch": head_pose.Pitch,
+                "yaw": head_pose.Yaw,
+                "roll": head_pose.Roll
+            }
+        
+        # 口罩信息（如果存在）
+        if attrs and hasattr(attrs, 'Mask') and attrs.Mask:
+            mask = attrs.Mask
+            result["mask"] = {
+                "type": mask.Type,
+                "probability": mask.Probability
+            }
+        
+        # 眼睛信息（如果存在）
+        if attrs and hasattr(attrs, 'Eye') and attrs.Eye:
+            eye = attrs.Eye
+            eye_info = {}
+            
+            # 眼睛开合状态
+            if hasattr(eye, 'EyeOpen') and eye.EyeOpen:
+                eye_info["eyeOpen"] = {
+                    "type": eye.EyeOpen.Type,
+                    "probability": eye.EyeOpen.Probability
+                }
+            
+            # 眼镜/墨镜信息
+            if hasattr(eye, 'Glass') and eye.Glass:
+                eye_info["glass"] = {
+                    "type": eye.Glass.Type,
+                    "probability": eye.Glass.Probability
+                }
+            
+            if eye_info:
+                result["eye"] = eye_info
+        
+        # 帽子信息（如果存在）
+        if attrs and hasattr(attrs, 'Hat') and attrs.Hat:
+            hat = attrs.Hat
+            hat_info = {}
+            
+            # 帽子样式
+            if hasattr(hat, 'Style') and hat.Style:
+                hat_info["style"] = {
+                    "type": hat.Style.Type,
+                    "probability": hat.Style.Probability
+                }
+            
+            # 帽子状态
+            if hasattr(hat, 'State') and hat.State:
+                hat_info["state"] = {
+                    "type": hat.State.Type,
+                    "probability": hat.State.Probability
+                }
+            
+            if hat_info:
+                result["hat"] = hat_info
+        
+        return result
 
 
 def main():
