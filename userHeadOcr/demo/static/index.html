@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>腾讯云OCR识别</title>
+    <!-- Import Style -->
+    <link rel="stylesheet" href="//unpkg.com/element-plus/dist/index.css" />
+    <!-- Import Vue 3 -->
+    <script src="//unpkg.com/vue@3"></script>
+    <!-- Import Element Plus -->
+    <script src="//unpkg.com/element-plus"></script>
+    <!-- Import Axios -->
+    <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <!-- Import SheetJS -->
+    <script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
+    <style>
+        body {
+            font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', '微软雅黑', Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f7fa;
+        }
+        .container {
+            max-width: 1400px; /* Increased width for OCR column */
+            margin: 0 auto;
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.1);
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #ebeef5;
+            padding-bottom: 20px;
+        }
+        .preview-image {
+            width: 80px;
+            height: 80px;
+            object-fit: cover;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .el-table .cell {
+            white-space: nowrap;
+        }
+        .ocr-result {
+            white-space: pre-wrap !important;
+            font-size: 12px;
+            max-height: 100px;
+            overflow-y: auto;
+            font-family: monospace;
+        }
+        .ocr-summary {
+            white-space: pre-wrap !important;
+            word-break: break-all;
+        }
+        .ocr-config-card {
+            margin-bottom: 20px;
+        }
+        .ocr-config-form .el-form-item {
+            margin-bottom: 0;
+            margin-right: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <div class="container">
+            <div class="header">
+                <div>
+                    <h2 style="margin: 0 0 5px 0;">腾讯云OCR识别</h2>
+                    <div style="font-size: 14px; color: #909399;">系统目的：找到头像识别的最佳OCR参数</div>
+                    <div style="font-size: 14px; color: #909399; margin-top: 5px;">列表数据是共享的，请不要同时执行，造成执行结果相互覆盖</div>
+                </div>
+                <div>
+                    <el-button type="success" @click="handleBatchOCR" :loading="batchLoading" :disabled="selectedItems.length === 0" style="margin-right: 10px;">批量OCR识别</el-button>
+                    <el-button type="info" @click="downloadOcrResults" style="margin-right: 10px;">下载OCR结果</el-button>
+                    <el-button type="primary" @click="handleAdd">新增数据</el-button>
+                </div>
+            </div>
+
+            <!-- OCR Configuration -->
+            <el-card class="ocr-config-card" header="OCR 参数配置（人脸姿态阈值）">
+                <el-form :inline="true" :model="ocrConfig" class="ocr-config-form">
+                    <el-form-item label="Pitch Min (俯仰)">
+                        <el-input-number v-model="ocrConfig.pitch_min" :step="1"></el-input-number>
+                    </el-form-item>
+                    <el-form-item label="Pitch Max">
+                        <el-input-number v-model="ocrConfig.pitch_max" :step="1"></el-input-number>
+                    </el-form-item>
+                    <el-form-item label="Yaw Min (偏航)">
+                        <el-input-number v-model="ocrConfig.yaw_min" :step="1"></el-input-number>
+                    </el-form-item>
+                    <el-form-item label="Yaw Max">
+                        <el-input-number v-model="ocrConfig.yaw_max" :step="1"></el-input-number>
+                    </el-form-item>
+                    <el-form-item label="Roll Min (平面旋转)">
+                        <el-input-number v-model="ocrConfig.roll_min" :step="1"></el-input-number>
+                    </el-form-item>
+                    <el-form-item label="Roll Max">
+                        <el-input-number v-model="ocrConfig.roll_max" :step="1"></el-input-number>
+                    </el-form-item>
+                    <el-form-item label="推荐配置">
+                        <el-button-group>
+                            <el-button type="primary" plain size="small" @click="applyPreset('default')" style="margin-right: 8px;">腾讯云默认</el-button>
+                            <el-button type="success" plain size="small" @click="applyPreset('loose')">宽松配置</el-button>
+                        </el-button-group>
+                    </el-form-item>
+                </el-form>
+            </el-card>
+
+            <!-- Table -->
+            <el-table :data="items" style="width: 100%" v-loading="loading" stripe border @selection-change="handleSelectionChange">
+                <el-table-column type="selection" width="55"></el-table-column>
+                <el-table-column prop="id" label="ID" width="80" sortable></el-table-column>
+                
+                <el-table-column label="图片预览" width="120">
+                    <template #default="scope">
+                        <el-image 
+                            v-if="scope.row.本地文件名"
+                            class="preview-image"
+                            :src="getImageUrl(scope.row.本地文件名)"
+                            :preview-src-list="[getImageUrl(scope.row.本地文件名)]"
+                            preview-teleported
+                            fit="cover">
+                            <template #error>
+                                <div style="display: flex; justify-content: center; align-items: center; height: 100%; background: #f5f7fa; color: #909399; font-size: 12px;">
+                                    无图片
+                                </div>
+                            </template>
+                        </el-image>
+                        <span v-else style="color: #909399">暂无</span>
+                    </template>
+                </el-table-column>
+
+                <el-table-column prop="本地文件名" label="本地文件名" min-width="150" show-overflow-tooltip></el-table-column>
+                
+                <el-table-column prop="URL" label="源 URL" min-width="180" show-overflow-tooltip>
+                    <template #default="scope">
+                        <a :href="scope.row.URL" target="_blank" style="color: #409EFF; text-decoration: none;">{{ scope.row.URL }}</a>
+                    </template>
+                </el-table-column>
+
+                <el-table-column label="是否应该通过" width="120">
+                    <template #default="scope">
+                        <el-tag v-if="scope.row.should_pass === true" type="success">是</el-tag>
+                        <el-tag v-else-if="scope.row.should_pass === false" type="danger">否</el-tag>
+                        <span v-else style="color: #909399">-</span>
+                    </template>
+                </el-table-column>
+
+                <el-table-column label="OCR是否通过" width="120">
+                    <template #default="scope">
+                        <el-tag v-if="scope.row.ocr_passed === true" type="success">是</el-tag>
+                        <el-tag v-else-if="scope.row.ocr_passed === false" type="danger">否</el-tag>
+                        <span v-else style="color: #909399">-</span>
+                    </template>
+                </el-table-column>
+
+                <!-- <el-table-column prop="下载时间" label="下载时间" width="160" sortable></el-table-column> -->
+
+                <!-- New OCR Result Column -->
+                <el-table-column label="OCR 摘要" min-width="180">
+                    <template #default="scope">
+                        <div class="ocr-summary">{{ getOcrSummary(scope.row.ocr_result) }}</div>
+                    </template>
+                </el-table-column>
+
+                <!-- <el-table-column label="OCR 结果" min-width="200">
+                    <template #default="scope">
+                        <div v-if="scope.row.ocr_result" class="ocr-result">{{ scope.row.ocr_result }}</div>
+                        <span v-else style="color: #909399">未识别</span>
+                    </template>
+                </el-table-column> -->
+
+                <el-table-column label="OCR 参数" min-width="150">
+                    <template #default="scope">
+                        <div v-if="getOcrConfig(scope.row.ocr_result)" class="ocr-result">
+                            {{ getOcrConfig(scope.row.ocr_result) }}
+                        </div>
+                        <span v-else style="color: #909399">-</span>
+                    </template>
+                </el-table-column>
+
+                <el-table-column label="操作" width="220" fixed="right">
+                    <template #default="scope">
+                        <el-button size="small" type="success" @click="handleOCR(scope.row)" :loading="scope.row.ocrLoading">OCR识别</el-button>
+                        <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
+                        <el-button size="small" type="danger" @click="handleDelete(scope.row)">删除</el-button>
+                    </template>
+                </el-table-column>
+            </el-table>
+        </div>
+
+        <!-- 编辑/新增对话框 -->
+        <el-dialog
+            v-model="dialogVisible"
+            :title="isEdit ? '编辑数据' : '新增数据'"
+            width="500px">
+            <el-form :model="form" label-width="100px">
+                <el-form-item label="上传方式" v-if="!isEdit">
+                    <el-radio-group v-model="uploadMode">
+                        <el-radio label="url">图片 URL</el-radio>
+                        <el-radio label="file">本地上传</el-radio>
+                    </el-radio-group>
+                </el-form-item>
+
+                <el-form-item label="URL" v-if="isEdit || uploadMode === 'url'">
+                    <el-input v-model="form.URL" placeholder="请输入图片源地址"></el-input>
+                </el-form-item>
+
+                <el-form-item label="是否应该通过">
+                    <el-radio-group v-model="form.should_pass">
+                        <el-radio :label="true">是</el-radio>
+                        <el-radio :label="false">否</el-radio>
+                    </el-radio-group>
+                </el-form-item>
+
+                <el-form-item label="选择图片" v-if="!isEdit && uploadMode === 'file'">
+                    <el-upload
+                        class="upload-demo"
+                        action="#"
+                        :auto-upload="false"
+                        :on-change="handleFileChange"
+                        :limit="1"
+                        :file-list="fileList"
+                        list-type="picture">
+                        <el-button type="primary">点击上传</el-button>
+                        <template #tip>
+                            <div class="el-upload__tip">
+                                只能上传 jpg/png 文件
+                            </div>
+                        </template>
+                    </el-upload>
+                </el-form-item>
+
+                <!-- Only URL is editable, others are readonly or hidden -->
+                <el-form-item label="本地文件名">
+                    <el-input v-model="form.本地文件名" placeholder="自动生成" disabled></el-input>
+                </el-form-item>
+                <el-form-item label="下载时间">
+                    <el-input v-model="form.下载时间" placeholder="自动生成" disabled></el-input>
+                </el-form-item>
+            </el-form>
+            <template #footer>
+                <span class="dialog-footer">
+                    <el-button @click="dialogVisible = false">取消</el-button>
+                    <el-button type="primary" @click="handleSave">确定</el-button>
+                </span>
+            </template>
+        </el-dialog>
+    </div>
+
+    <script>
+        const { createApp, ref, reactive, onMounted, watch } = Vue;
+        const { ElMessage, ElMessageBox } = ElementPlus;
+
+        const app = createApp({
+            setup() {
+                const items = ref([]);
+                const loading = ref(false);
+                const dialogVisible = ref(false);
+                const isEdit = ref(false);
+                const uploadMode = ref('file'); // Default to 'file'
+                const fileList = ref([]);
+                const form = reactive({
+                    id: null,
+                    URL: '',
+                    本地文件名: '',
+                    下载时间: '',
+                    should_pass: null
+                });
+                
+                // Batch Selection
+                const selectedItems = ref([]);
+                const batchLoading = ref(false);
+
+                // OCR Configuration
+                const defaultOcrConfig = {
+                    pitch_min: -10,
+                    pitch_max: 10,
+                    yaw_min: -10,
+                    yaw_max: 10,
+                    roll_min: -20,
+                    roll_max: 20
+                };
+                
+                // Load from localStorage or use default
+                let initialConfig = defaultOcrConfig;
+                try {
+                    const saved = localStorage.getItem('ocrConfig');
+                    if (saved) {
+                        initialConfig = { ...defaultOcrConfig, ...JSON.parse(saved) };
+                    }
+                } catch (e) {
+                    console.error('Failed to load OCR config', e);
+                }
+
+                const ocrConfig = reactive(initialConfig);
+
+                // Watch and save to localStorage
+                watch(ocrConfig, (newVal) => {
+                    localStorage.setItem('ocrConfig', JSON.stringify(newVal));
+                }, { deep: true });
+
+                // OCR Configuration presets
+                const presets = {
+                    default: {
+                        pitch_min: -10,
+                        pitch_max: 10,
+                        yaw_min: -10,
+                        yaw_max: 10,
+                        roll_min: -20,
+                        roll_max: 20
+                    },
+                    loose: {
+                        pitch_min: -20,
+                        pitch_max: 20,
+                        yaw_min: -20,
+                        yaw_max: 20,
+                        roll_min: -20,
+                        roll_max: 20
+                    }
+                };
+
+                // 应用预设配置
+                const applyPreset = (type) => {
+                    const config = presets[type];
+                    if (config) {
+                        ElMessageBox.confirm(
+                            `确定要应用${type === 'default' ? '腾讯云默认' : '宽松'}配置吗？`,
+                            '提示',
+                            {
+                                confirmButtonText: '确定',
+                                cancelButtonText: '取消',
+                                type: 'warning',
+                            }
+                        )
+                        .then(() => {
+                            Object.assign(ocrConfig, config);
+                            ElMessage.success('配置已应用');
+                        })
+                        .catch(() => {});
+                    }
+                };
+
+                // 获取数据
+                const fetchItems = async () => {
+                    loading.value = true;
+                    try {
+                        const response = await axios.get('/api/items');
+                        items.value = response.data.map(item => ({
+                            ...item,
+                            ocrLoading: false // Add loading state for OCR button
+                        }));
+                    } catch (error) {
+                        ElMessage.error('获取数据失败: ' + error.message);
+                    } finally {
+                        loading.value = false;
+                    }
+                };
+
+                // 图片地址处理
+                const getImageUrl = (filename) => {
+                    if (!filename) return '';
+                    return `/images/${filename}`;
+                };
+
+                // 打开新增弹窗
+                const handleAdd = () => {
+                    isEdit.value = false;
+                    form.id = null;
+                    form.URL = '';
+                    form.本地文件名 = '';
+                    form.下载时间 = '';
+                    form.should_pass = null;
+                    uploadMode.value = 'file';
+                    fileList.value = [];
+                    dialogVisible.value = true;
+                };
+
+                // 打开编辑弹窗
+                const handleEdit = (row) => {
+                    isEdit.value = true;
+                    form.id = row.id;
+                    form.URL = row.URL;
+                    form.本地文件名 = row.本地文件名;
+                    form.下载时间 = row.下载时间;
+                    form.should_pass = row.should_pass;
+                    dialogVisible.value = true;
+                };
+
+                const handleFileChange = (uploadFile, uploadFiles) => {
+                    fileList.value = uploadFiles.slice(-1);
+                };
+
+                // 保存数据
+                const handleSave = async () => {
+                    try {
+                        if (isEdit.value) {
+                             const payload = {
+                                id: form.id,
+                                URL: form.URL,
+                                should_pass: form.should_pass
+                            };
+                            await axios.put(`/api/items/${form.id}`, payload);
+                            ElMessage.success('更新成功，图片已重新下载');
+                        } else {
+                            const formData = new FormData();
+                            
+                            if (form.should_pass !== null) formData.append('should_pass', form.should_pass);
+
+                            if (uploadMode.value === 'file') {
+                                if (fileList.value.length === 0) {
+                                    ElMessage.warning('请选择要上传的图片');
+                                    return;
+                                }
+                                formData.append('file', fileList.value[0].raw);
+                            } else {
+                                if (!form.URL) {
+                                    ElMessage.warning('请输入图片 URL');
+                                    return;
+                                }
+                                formData.append('url', form.URL);
+                            }
+
+                            await axios.post('/api/items', formData, {
+                                headers: {
+                                    'Content-Type': 'multipart/form-data'
+                                }
+                            });
+                            ElMessage.success('新增成功');
+                        }
+                        dialogVisible.value = false;
+                        fetchItems();
+                    } catch (error) {
+                        ElMessage.error('保存失败: ' + (error.response?.data?.detail || error.message));
+                    }
+                };
+
+                // 删除数据
+                const handleDelete = (row) => {
+                    ElMessageBox.confirm(
+                        `确定要删除 ID 为 ${row.id} 的记录吗？`,
+                        '警告',
+                        {
+                            confirmButtonText: '确定',
+                            cancelButtonText: '取消',
+                            type: 'warning',
+                        }
+                    )
+                    .then(async () => {
+                        try {
+                            await axios.delete(`/api/items/${row.id}`);
+                            ElMessage.success('删除成功');
+                            fetchItems();
+                        } catch (error) {
+                            ElMessage.error('删除失败: ' + error.message);
+                        }
+                    })
+                    .catch(() => {});
+                };
+
+                // OCR 核心逻辑
+                const performOCR = async (row, showMessage = true) => {
+                    row.ocrLoading = true;
+                    try {
+                        const response = await axios.post(`/api/items/${row.id}/ocr`, {
+                            pitch_min: ocrConfig.pitch_min,
+                            pitch_max: ocrConfig.pitch_max,
+                            yaw_min: ocrConfig.yaw_min,
+                            yaw_max: ocrConfig.yaw_max,
+                            roll_min: ocrConfig.roll_min,
+                            roll_max: ocrConfig.roll_max
+                        });
+                        if (response.data.success) {
+                            if (showMessage) ElMessage.success('OCR 识别成功');
+                            // Update local data
+                            row.ocr_result = response.data.ocr_result;
+                            row.ocr_passed = response.data.ocr_passed;
+                            return true;
+                        }
+                        return false;
+                    } catch (error) {
+                        if (showMessage) ElMessage.error('OCR 识别失败: ' + (error.response?.data?.detail || error.message));
+                        return false;
+                    } finally {
+                        row.ocrLoading = false;
+                    }
+                };
+
+                // 单个 OCR 识别
+                const handleOCR = (row) => performOCR(row, true);
+
+                // 批量选择变化
+                const handleSelectionChange = (val) => {
+                    selectedItems.value = val;
+                };
+
+                // 批量 OCR 识别
+                const handleBatchOCR = async () => {
+                    if (selectedItems.value.length === 0) return;
+                    
+                    batchLoading.value = true;
+                    let successCount = 0;
+                    
+                    try {
+                        for (const row of selectedItems.value) {
+                            const success = await performOCR(row, false);
+                            if (success) successCount++;
+                        }
+                        ElMessage.success(`批量处理完成: 成功 ${successCount}/${selectedItems.value.length}`);
+                    } catch (e) {
+                        ElMessage.error('批量处理异常: ' + e.message);
+                    } finally {
+                        batchLoading.value = false;
+                    }
+                };
+
+                const getOcrSummary = (jsonStr) => {
+                    if (!jsonStr) return '未识别';
+                    try {
+                        const result = JSON.parse(jsonStr);
+                        // head_ocr.py returns a 'message' field
+                        if (result.message) {
+                             // Add icon/color based on hasValidAvatar
+                            const icon = result.hasValidAvatar ? '✅ ' : '❌ ';
+                            return icon + result.message;
+                        }
+                        // Fallback for old data or errors
+                        if (result.Error) return '❌ 错误: ' + result.Error;
+                        return '未知结果';
+                    } catch (e) {
+                        return '解析失败';
+                    }
+                };
+
+                const getOcrConfig = (jsonStr) => {
+                    if (!jsonStr) return '';
+                    try {
+                        const result = JSON.parse(jsonStr);
+                        if (result.config) {
+                            return JSON.stringify(result.config, null, 2);
+                        }
+                        return '';
+                    } catch (e) {
+                        return '';
+                    }
+                };
+
+                // 下载 OCR 结果
+                const downloadOcrResults = () => {
+                    if (items.value.length === 0) {
+                        ElMessage.warning('暂无数据可下载');
+                        return;
+                    }
+
+                    try {
+                        // Prepare data for Excel
+                        // Columns: id、是否应该通过、是否通过、本地文件名、源url、ocr摘要、ocr参数、ocr结果
+                        const data = items.value.map(item => ({
+                            id: item.id,
+                            '是否应该通过': item.should_pass === true ? '是' : (item.should_pass === false ? '否' : ''),
+                            '是否通过': item.ocr_passed === true ? '是' : (item.ocr_passed === false ? '否' : ''),
+                            '本地文件名': item['本地文件名'],
+                            '源URL': item.URL,
+                            'OCR摘要': getOcrSummary(item.ocr_result),
+                            'OCR参数': getOcrConfig(item.ocr_result),
+                            'OCR结果': item.ocr_result || ''
+                        }));
+
+                        // Create worksheet
+                        const ws = XLSX.utils.json_to_sheet(data);
+                        
+                        // Create workbook
+                        const wb = XLSX.utils.book_new();
+                        XLSX.utils.book_append_sheet(wb, ws, "OCR_Results");
+                        
+                        // Generate filename with timestamp
+                        const date = new Date();
+                        const timestamp = date.getFullYear() +
+                            ('0' + (date.getMonth() + 1)).slice(-2) +
+                            ('0' + date.getDate()).slice(-2) + '_' +
+                            ('0' + date.getHours()).slice(-2) +
+                            ('0' + date.getMinutes()).slice(-2) +
+                            ('0' + date.getSeconds()).slice(-2);
+                        
+                        // Download
+                        XLSX.writeFile(wb, `ocr_results_${timestamp}.xlsx`);
+                        ElMessage.success('下载已开始');
+                    } catch (e) {
+                        console.error('Download failed', e);
+                        ElMessage.error('下载失败: ' + e.message);
+                    }
+                };
+
+                onMounted(() => {
+                    fetchItems();
+                });
+
+                return {
+                    items,
+                    loading,
+                    dialogVisible,
+                    isEdit,
+                    form,
+                    getImageUrl,
+                    handleAdd,
+                    handleEdit,
+                    handleFileChange,
+                    handleSave,
+                    handleDelete,
+                    handleOCR,
+                    handleBatchOCR,
+                    handleSelectionChange,
+                    selectedItems,
+                    batchLoading,
+                    applyPreset,
+                    uploadMode,
+                    fileList,
+                    getOcrSummary,
+                    getOcrConfig,
+                    ocrConfig,
+                    downloadOcrResults
+                };
+            }
+        });
+
+        app.use(ElementPlus);
+        app.mount('#app');
+    </script>
+</body>
+</html>
